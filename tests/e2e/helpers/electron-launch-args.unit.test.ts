@@ -16,9 +16,11 @@ describe('getOrcaElectronLaunchArgs', () => {
     (platform, ci, headful, enabled) => {
       vi.stubGlobal('process', { ...process, platform, env: { ...process.env, CI: ci } })
       const args = getOrcaElectronLaunchArgs(join('orca', 'out', 'main', 'index.js'), headful)
+      expect(args.includes('--use-gl=angle')).toBe(enabled)
       expect(args.includes('--use-angle=swiftshader')).toBe(enabled)
       expect(args.includes('--enable-unsafe-swiftshader')).toBe(enabled)
       if (enabled) {
+        expect(args).toContain('--disable-gpu-sandbox')
         expect(args).not.toContain('--disable-gpu')
       }
     }
