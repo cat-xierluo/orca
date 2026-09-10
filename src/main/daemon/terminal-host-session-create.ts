@@ -192,7 +192,9 @@ async function spawnAndPublishSession(
       commandLength: opts.command?.length ?? 0,
       viaShellArgs: subprocess.startupCommandDeliveredInShellArgs === true,
       queuedByShellReadyBarrier: shellReadySupported,
-      ...(loadGate.deferred ? { deferredByLoad: true } : {})
+      // Only meaningful when there was a command the gate actually held back;
+      // a no-command session must not read as "deferred by load".
+      ...(loadGate.deferred && startupCommandWritten ? { deferredByLoad: true } : {})
     })
   } catch {
     // Diagnostics must never turn a live PTY into a failed create.
