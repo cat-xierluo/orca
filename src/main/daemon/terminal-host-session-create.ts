@@ -176,27 +176,32 @@ async function spawnAndPublishSession(
 
   const startupCommandWritten =
     Boolean(opts.command) && !subprocess.startupCommandDeliveredInShellArgs
+  // Why (#19828): recovery re-delivers the saved startup command right after a
+  // daemon restart; when the machine is still under heavy load (often because
+  // that same command is what died), re-running it immediately reproduces the
+  // crash and can loop. Opt-in gate defers delivery instead of executing it.
+  const loadGate = shouldDeferStartupCommand()
+  const commandWrittenAfterGate = startupCommandWritten && !loadGate.deferred
   // Why: without this, a missing command and a lost one log identically.
   // Length, never the text -- launches can carry credentials.
   try {
     deps.reportReadinessEvent?.('startup-command-delivery', {
       sessionId: opts.sessionId,
-      written: startupCommandWritten,
+      written: commandWrittenAfterGate,
       hasCommand: Boolean(opts.command),
       commandLength: opts.command?.length ?? 0,
       viaShellArgs: subprocess.startupCommandDeliveredInShellArgs === true,
-      queuedByShellReadyBarrier: shellReadySupported
+      queuedByShellReadyBarrier: shellReadySupported,
+      ...(loadGate.deferred ? { deferredByLoad: true } : {})
     })
   } catch {
     // Diagnostics must never turn a live PTY into a failed create.
   }
-  if (startupCommandWritten && opts.command) {
-    // Why (#19828): recovery re-delivers the saved startup command right after a
-    // daemon restart; when the machine is still under heavy load (often because
-    // that same command is what died), re-running it immediately reproduces the
-    // crash and can loop. Opt-in gate defers delivery instead of executing it.
-    const loadGate = shouldDeferStartupCommand()
-    if (loadGate.deferred) {
+  if (startupCommandWritten && opts.command && loadGate.deferred) {
+    // Why event-only: Session.write forwards to the child's stdin, so writing
+    // a notice there would submit it to the shell as a command. The deferral
+    // is surfaced through the readiness stream (renderer-visible) instead.
+    try {
       deps.reportReadinessEvent?.('startup-command-deferred-load', {
         sessionId: opts.sessionId,
         commandLength: opts.command.length,
@@ -204,22 +209,18 @@ async function spawnAndPublishSession(
         limit: loadGate.limit,
         cpuCount: loadGate.cpuCount
       })
-      // Why a fixed notice instead of typing the command: typing without the
-      // paste-safe submission wrapper risks multiline/injection re-execution,
-      // and the operator should decide when load has actually recovered.
-      session.write(
-        `[orca] startup command deferred: 1-min load ${loadGate.load1.toFixed(2)} > ${loadGate.limit.toFixed(2)} (${loadGate.cpuCount} cpus); re-run it once load recovers.\r\n`
-      )
-    } else {
-      const submit = process.platform === 'win32' ? '\r' : '\n'
-      // Why: only Orca-wrapped shells advertise the paste-safe startup barrier.
-      session.write(
-        buildStartupCommandSubmission(opts.command, {
-          submit,
-          bracketedPasteSafe: shellReadySupported
-        })
-      )
+    } catch {
+      // Diagnostics must never turn a live PTY into a failed create.
     }
+  } else if (startupCommandWritten && opts.command) {
+    const submit = process.platform === 'win32' ? '\r' : '\n'
+    // Why: only Orca-wrapped shells advertise the paste-safe startup barrier.
+    session.write(
+      buildStartupCommandSubmission(opts.command, {
+        submit,
+        bracketedPasteSafe: shellReadySupported
+      })
+    )
   }
 
   return {

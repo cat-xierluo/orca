@@ -31,9 +31,10 @@ function mockSubprocess(): SubprocessHandle {
   } as SubprocessHandle
 }
 
-const fixedInputs = (load1: number, cpuCount = 8) => ({
+const fixedInputs = (load1: number, cpuCount = 8, platform: NodeJS.Platform = 'darwin') => ({
   loadavg: () => [load1, 0, 0] as number[],
-  cpuCount
+  cpuCount,
+  platform
 })
 
 describe('shouldDeferStartupCommand', () => {
@@ -73,7 +74,18 @@ describe('shouldDeferStartupCommand', () => {
     expect(
       shouldDeferStartupCommand(
         { ORCA_STARTUP_COMMAND_MAX_LOAD_PER_CPU: '2' },
-        { loadavg: () => [Number.NaN], cpuCount: 8 }
+        { loadavg: () => [Number.NaN], cpuCount: 8, platform: 'darwin' }
+      )
+    ).toEqual({ deferred: false })
+  })
+
+  it('never defers on win32: os.loadavg() there is [0,0,0], so the gate cannot engage', () => {
+    // Even a high mocked load and a low limit must not defer on win32 —
+    // the disablement is explicit, not dependent on the (always-zero) reading.
+    expect(
+      shouldDeferStartupCommand(
+        { ORCA_STARTUP_COMMAND_MAX_LOAD_PER_CPU: '0.1' },
+        fixedInputs(99, 8, 'win32')
       )
     ).toEqual({ deferred: false })
   })
@@ -84,12 +96,15 @@ describe('shouldDeferStartupCommand', () => {
 // unit test cannot catch a wiring regression.
 describe('TerminalHost startup command load gate', () => {
   const ENV_KEY = 'ORCA_STARTUP_COMMAND_MAX_LOAD_PER_CPU'
+  const originalEnvValue = process.env[ENV_KEY]
 
   let sub: SubprocessHandle
   let host: TerminalHost
   let readinessEvents: Array<{ event: string; details: Record<string, unknown> }>
 
   beforeEach(() => {
+    // Why: a runner-provided value would flip the "not configured" test.
+    delete process.env[ENV_KEY]
     sub = mockSubprocess()
     readinessEvents = []
     host = new TerminalHost({
@@ -99,7 +114,8 @@ describe('TerminalHost startup command load gate', () => {
   })
 
   afterEach(() => {
-    delete process.env[ENV_KEY]
+    if (originalEnvValue === undefined) delete process.env[ENV_KEY]
+    else process.env[ENV_KEY] = originalEnvValue
   })
 
   it('delivers the startup command when the gate is not configured', async () => {
@@ -111,10 +127,12 @@ describe('TerminalHost startup command load gate', () => {
       shellReadySupported: false,
       streamClient: { onData: vi.fn(), onExit: vi.fn() }
     })
-    expect(vi.mocked(sub.write)).toHaveBeenCalledWith('claude\n')
+    // POSIX submits with LF, Windows with CR — mirror the delivery site.
+    const submit = process.platform === 'win32' ? 'claude\r' : 'claude\n'
+    expect(vi.mocked(sub.write)).toHaveBeenCalledWith(submit)
   })
 
-  it('defers delivery and reports the event when load exceeds the limit', async () => {
+  it('defers delivery without writing anything to the shell when load exceeds the limit', async () => {
     process.env[ENV_KEY] = '2' // limit = 2 × 8 = 16, mocked loadavg(1m) = 99
     await host.createOrAttach({
       sessionId: 's-gated',
@@ -124,9 +142,12 @@ describe('TerminalHost startup command load gate', () => {
       shellReadySupported: false,
       streamClient: { onData: vi.fn(), onExit: vi.fn() }
     })
-    const writes = vi.mocked(sub.write).mock.calls.map((c) => String(c[0]))
-    expect(writes).not.toContain('run-heavy-tests\n')
-    expect(writes.join('')).toContain('startup command deferred')
+    // The session must be left a pristine idle shell: no command, no notice —
+    // anything written here goes to the child's stdin and would execute.
+    expect(vi.mocked(sub.write).mock.calls).toHaveLength(0)
+    const delivery = readinessEvents.find((e) => e.event === 'startup-command-delivery')
+    expect(delivery?.details.written).toBe(false)
+    expect(delivery?.details.deferredByLoad).toBe(true)
     const deferred = readinessEvents.find((e) => e.event === 'startup-command-deferred-load')
     expect(deferred).toBeDefined()
     expect(deferred?.details.commandLength).toBe('run-heavy-tests'.length)

@@ -14,7 +14,9 @@ import os from 'node:os'
  * the configured multiple of CPU count. The session is still created and left
  * as an idle shell; the command is NOT typed or executed, and a
  * `startup-command-deferred-load` readiness event records its length and the
- * measured load so operators can re-run it manually once load recovers.
+ * measured load so operators can re-run it manually once load recovers. The
+ * deferral is surfaced only through the readiness event — writing a notice into
+ * the PTY would submit it to the shell as input.
  *
  * Configuration (off by default, so existing behavior is unchanged):
  *   ORCA_STARTUP_COMMAND_MAX_LOAD_PER_CPU — e.g. "2.0" defers while
@@ -28,11 +30,17 @@ export type StartupCommandLoadGateDecision =
 
 export function shouldDeferStartupCommand(
   env: NodeJS.ProcessEnv = process.env,
-  inputs: { loadavg: () => number[]; cpuCount: number } = {
-    loadavg: () => os.loadavg(),
-    cpuCount: os.cpus().length
-  }
+  inputs: {
+    loadavg: () => number[]
+    cpuCount: number
+    platform?: NodeJS.Platform
+  } = { loadavg: () => os.loadavg(), cpuCount: os.cpus().length }
 ): StartupCommandLoadGateDecision {
+  // Windows: os.loadavg() is [0, 0, 0] there, so the comparison would never
+  // defer anything. Disable explicitly (and observably via the event stream)
+  // rather than shipping a gate that silently cannot engage.
+  const platform = inputs.platform ?? process.platform
+  if (platform === 'win32') return { deferred: false }
   const raw = env.ORCA_STARTUP_COMMAND_MAX_LOAD_PER_CPU
   if (raw === undefined || raw === '') return { deferred: false }
   const perCpu = Number(raw)
