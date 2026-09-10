@@ -15,6 +15,7 @@ import { TerminalAttachCanceledError } from './daemon-errors'
 import { rejectOnAbort } from './terminal-attach-cancellation'
 import { SessionNotFoundError } from './types'
 import { resolveWslSessionContext } from './wsl-session-context'
+import { shouldDeferStartupCommand } from './startup-command-load-gate'
 
 type TerminalHostSessionCreateDependencies = {
   sessions: Map<string, Session>
@@ -190,14 +191,35 @@ async function spawnAndPublishSession(
     // Diagnostics must never turn a live PTY into a failed create.
   }
   if (startupCommandWritten && opts.command) {
-    const submit = process.platform === 'win32' ? '\r' : '\n'
-    // Why: only Orca-wrapped shells advertise the paste-safe startup barrier.
-    session.write(
-      buildStartupCommandSubmission(opts.command, {
-        submit,
-        bracketedPasteSafe: shellReadySupported
+    // Why (#19828): recovery re-delivers the saved startup command right after a
+    // daemon restart; when the machine is still under heavy load (often because
+    // that same command is what died), re-running it immediately reproduces the
+    // crash and can loop. Opt-in gate defers delivery instead of executing it.
+    const loadGate = shouldDeferStartupCommand()
+    if (loadGate.deferred) {
+      deps.reportReadinessEvent?.('startup-command-deferred-load', {
+        sessionId: opts.sessionId,
+        commandLength: opts.command.length,
+        load1: loadGate.load1,
+        limit: loadGate.limit,
+        cpuCount: loadGate.cpuCount
       })
-    )
+      // Why a fixed notice instead of typing the command: typing without the
+      // paste-safe submission wrapper risks multiline/injection re-execution,
+      // and the operator should decide when load has actually recovered.
+      session.write(
+        `[orca] startup command deferred: 1-min load ${loadGate.load1.toFixed(2)} > ${loadGate.limit.toFixed(2)} (${loadGate.cpuCount} cpus); re-run it once load recovers.\r\n`
+      )
+    } else {
+      const submit = process.platform === 'win32' ? '\r' : '\n'
+      // Why: only Orca-wrapped shells advertise the paste-safe startup barrier.
+      session.write(
+        buildStartupCommandSubmission(opts.command, {
+          submit,
+          bracketedPasteSafe: shellReadySupported
+        })
+      )
+    }
   }
 
   return {
